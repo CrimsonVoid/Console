@@ -2,6 +2,7 @@ package console
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"os"
 	"regexp"
@@ -13,9 +14,12 @@ type re struct {
 	fn func(string)
 }
 
-type console struct {
-	reader *bufio.Reader
-	Delim  byte
+type Console struct {
+	rc      *io.ReadCloser
+	reader  *bufio.Reader
+	Delim   byte
+	running bool
+	mut     sync.RWMutex
 
 	stMap map[string][]func(string)
 	stMut sync.RWMutex
@@ -24,72 +28,100 @@ type console struct {
 	reMut sync.RWMutex
 }
 
-func New() *console {
+func New() *Console {
 	return NewReader(os.Stdin)
 }
 
-func NewReader(rd io.Reader) *console {
-	cns := new(console)
-
-	cns.reader = bufio.NewReader(rd)
-	cns.stMap = make(map[string][]func(string))
-	cns.Delim = '\n'
-
-	return cns
+func NewReader(rc io.ReadCloser) *Console {
+	return &Console{
+		rc:      &rc,
+		stMap:   make(map[string][]func(string), 5),
+		Delim:   '\n',
+		running: false,
+	}
 }
 
-func (c *console) Register(trigger string, fn func(string)) {
+func (c *Console) Register(trigger string, fn func(string)) {
 	c.stMut.Lock()
+	defer c.stMut.Unlock()
+
 	f := c.stMap[trigger]
 	f = append(f, fn)
 	c.stMap[trigger] = f
-	c.stMut.Unlock()
 }
 
-func (c *console) RegisterRegexp(trigger *regexp.Regexp, fn func(string)) {
-	reM := new(re)
-	reM.re = trigger
-	reM.fn = fn
+func (c *Console) RegisterRegexp(trigger *regexp.Regexp, fn func(string)) {
+	reM := &re{
+		re: trigger,
+		fn: fn,
+	}
 
 	c.reMut.Lock()
+	defer c.reMut.Unlock()
+
 	c.reMap = append(c.reMap, reM)
-	c.reMut.Unlock()
 }
 
-func (c *console) Monitor() error {
-	for {
+func (c *Console) Monitoring() bool {
+	c.mut.RLock()
+	defer c.mut.RUnlock()
+
+	return c.running
+}
+
+func (c *Console) setMonitor(m bool) {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
+	c.running = m
+}
+
+func (c *Console) Monitor() error {
+	if c.Monitoring() {
+		return errors.New("Already monitoring")
+	}
+
+	c.reader = bufio.NewReader(*c.rc)
+	defer (*c.rc).Close()
+
+	c.setMonitor(true)
+	defer c.setMonitor(false) // In-case unnatural exit
+
+	for c.Monitoring() {
 		s, err := c.reader.ReadString(c.Delim)
-		if err != nil {
+		if err == io.EOF {
+			return nil
+		} else if err != nil {
 			return err
 		}
 
-		in := s[:len(s)-1]
-		go c.handleString(in)
-		go c.handleRegexp(in)
+		go c.handleRegexp(s[:len(s)-1])
+		go c.handleString(s[:len(s)-1])
 	}
+
+	return nil
 }
 
-func (c *console) handleString(s string) {
-	c.stMut.RLock()
-	fnMap, ok := c.stMap[s]
-	if !ok {
-		return
-	}
+func (c *Console) Stop() {
+	c.setMonitor(false)
+}
 
-	for _, f := range fnMap {
+func (c *Console) handleString(s string) {
+	c.stMut.RLock()
+	defer c.stMut.RUnlock()
+
+	for _, f := range c.stMap[s] {
 		go f(s)
 	}
-	c.stMut.RUnlock()
 }
 
-func (c *console) handleRegexp(s string) {
+func (c *Console) handleRegexp(s string) {
 	c.reMut.RLock()
-	for _, reM := range c.reMap {
-		if reM.re.FindStringSubmatch(s) == nil {
-			continue
-		}
+	defer c.reMut.RUnlock()
 
-		go reM.fn(s)
+	for _, reM := range c.reMap {
+		if reM.re.FindStringSubmatch(s) != nil {
+			go reM.fn(s)
+		}
 	}
-	c.reMut.RUnlock()
 }
