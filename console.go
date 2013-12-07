@@ -14,12 +14,19 @@ type re struct {
 	fn func(string)
 }
 
+type msgErr struct {
+	msg string
+	err error
+}
+
+// Console struct to hold state
 type Console struct {
-	rc      *io.ReadCloser
 	reader  *bufio.Reader
-	Delim   byte
+	Delim   byte // Delimiter when reading from io.Reader; defaults to '\n'
 	running bool
 	mut     sync.RWMutex
+	msg     chan *msgErr
+	exit    chan bool
 
 	stMap map[string][]func(string)
 	stMut sync.RWMutex
@@ -28,100 +35,120 @@ type Console struct {
 	reMut sync.RWMutex
 }
 
+// Create a new Console with os.Stdin
 func New() *Console {
 	return NewReader(os.Stdin)
 }
 
-func NewReader(rc io.ReadCloser) *Console {
+// Create a console with the Reader rc
+func NewReader(rc io.Reader) *Console {
 	return &Console{
-		rc:      &rc,
+		reader:  bufio.NewReader(rc),
 		stMap:   make(map[string][]func(string), 5),
 		Delim:   '\n',
 		running: false,
+		msg:     make(chan *msgErr, 5),
+		exit:    make(chan bool),
 	}
 }
 
-func (c *Console) Register(trigger string, fn func(string)) {
-	c.stMut.Lock()
-	defer c.stMut.Unlock()
+// Register a function that is called when trigger is matched. The input string
+// is passed to the function to be called. Triggered functions are run in a goroutine.
+func (self *Console) Register(trigger string, fn func(string)) {
+	self.stMut.Lock()
+	defer self.stMut.Unlock()
 
-	f := c.stMap[trigger]
+	f := self.stMap[trigger]
 	f = append(f, fn)
-	c.stMap[trigger] = f
+	self.stMap[trigger] = f
 }
 
-func (c *Console) RegisterRegexp(trigger *regexp.Regexp, fn func(string)) {
+// Register a function that is called when trigger is matched. The input string
+// is passed to the function to be called. Triggered functions are run in a goroutine.
+func (self *Console) RegisterRegexp(trigger *regexp.Regexp, fn func(string)) {
 	reM := &re{
 		re: trigger,
 		fn: fn,
 	}
 
-	c.reMut.Lock()
-	defer c.reMut.Unlock()
+	self.reMut.Lock()
+	defer self.reMut.Unlock()
 
-	c.reMap = append(c.reMap, reM)
+	self.reMap = append(self.reMap, reM)
 }
 
-func (c *Console) Monitoring() bool {
-	c.mut.RLock()
-	defer c.mut.RUnlock()
+// Returns true if it is monitoring input
+func (self *Console) Monitoring() bool {
+	self.mut.RLock()
+	defer self.mut.RUnlock()
 
-	return c.running
+	return self.running
 }
 
-func (c *Console) setMonitor(m bool) {
-	c.mut.Lock()
-	defer c.mut.Unlock()
+func (self *Console) setMonitor(m bool) {
+	self.mut.Lock()
+	defer self.mut.Unlock()
 
-	c.running = m
+	self.running = m
 }
 
-func (c *Console) Monitor() error {
-	if c.Monitoring() {
+// Reads from the set io.Reader and calls functions as necessary. An error can
+// indicate either the Console is already monitoring or if there was an error
+// reading from io.Reader
+func (self *Console) Monitor() error {
+	if self.Monitoring() {
 		return errors.New("Already monitoring")
 	}
 
-	c.reader = bufio.NewReader(*c.rc)
-	defer (*c.rc).Close()
+	self.setMonitor(true)
+	defer self.setMonitor(false)
 
-	c.setMonitor(true)
-	defer c.setMonitor(false) // In-case unnatural exit
-
-	for c.Monitoring() {
-		s, err := c.reader.ReadString(c.Delim)
-		if err == io.EOF {
-			return nil
-		} else if err != nil {
-			return err
+	// TODO - Exit goroutine
+	go func() {
+		for {
+			s, err := self.reader.ReadString(self.Delim)
+			self.msg <- &msgErr{s[:len(s)-1], err}
 		}
+	}()
 
-		go c.handleRegexp(s[:len(s)-1])
-		go c.handleString(s[:len(s)-1])
-	}
+	for {
+		select {
+		case m := <-self.msg:
+			if m.err != nil {
+				return m.err
+			}
 
-	return nil
-}
-
-func (c *Console) Stop() {
-	c.setMonitor(false)
-}
-
-func (c *Console) handleString(s string) {
-	c.stMut.RLock()
-	defer c.stMut.RUnlock()
-
-	for _, f := range c.stMap[s] {
-		go f(s)
+			go self.handleRegexp(m.msg)
+			go self.handleString(m.msg)
+		case <-self.exit:
+			return nil
+		}
 	}
 }
 
-func (c *Console) handleRegexp(s string) {
-	c.reMut.RLock()
-	defer c.reMut.RUnlock()
+// Stops the Console from monitoring. Call this to clean up goroutines
+func (self *Console) Stop() {
+	self.exit <- true
+}
 
-	for _, reM := range c.reMap {
-		if reM.re.FindStringSubmatch(s) != nil {
-			go reM.fn(s)
+// Parse cmd and call appropriate functions
+func (self *Console) handleString(cmd string) {
+	self.stMut.RLock()
+	defer self.stMut.RUnlock()
+
+	for _, f := range self.stMap[cmd] {
+		go f(cmd)
+	}
+}
+
+// Match cmd and call appropriate functions
+func (self *Console) handleRegexp(cmd string) {
+	self.reMut.RLock()
+	defer self.reMut.RUnlock()
+
+	for _, reM := range self.reMap {
+		if reM.re.FindStringSubmatch(cmd) != nil {
+			go reM.fn(cmd)
 		}
 	}
 }
