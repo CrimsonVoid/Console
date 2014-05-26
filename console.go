@@ -96,7 +96,19 @@ func (self *Console) Close() {
 
 // Register a function that is called when trigger is matched. The input string
 // is passed to the function to be called. Triggered functions run concurrently.
-func (self *Console) Register(trigger string, fn func(string)) {
+func (self *Console) Register(trigger interface{}, fn func(string)) {
+	switch trigger.(type) {
+	case string:
+		self.registerString(trigger.(string), fn)
+	case *regexp.Regexp:
+		self.registerRegexp(trigger.(*regexp.Regexp), fn)
+	case regexp.Regexp:
+		re := trigger.(regexp.Regexp)
+		self.registerRegexp(&re, fn)
+	}
+}
+
+func (self *Console) registerString(trigger string, fn func(string)) {
 	self.stMut.Lock()
 	defer self.stMut.Unlock()
 
@@ -107,7 +119,7 @@ func (self *Console) Register(trigger string, fn func(string)) {
 
 // Register a function that is called when trigger is matched. The input string
 // is passed to the function to be called. Triggered functions run concurrently.
-func (self *Console) RegisterRegexp(trigger *regexp.Regexp, fn func(string)) {
+func (self *Console) registerRegexp(trigger *regexp.Regexp, fn func(string)) {
 	reM := &re{
 		re: trigger,
 		fn: fn,
