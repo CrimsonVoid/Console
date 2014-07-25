@@ -2,11 +2,10 @@ package console
 
 import (
 	"bufio"
-	"errors"
 	"io"
-	"os"
 	"regexp"
 	"sync"
+	"sync/atomic"
 )
 
 type re struct {
@@ -21,12 +20,10 @@ type msgErr struct {
 
 // Console struct to hold state
 type Console struct {
-	reader  *bufio.Reader
-	Delim   byte // Delimiter when reading from io.Reader; defaults to '\n'
-	running bool
-	mut     sync.RWMutex
-	msg     chan *msgErr
-	exit    chan bool
+	reader     *bufio.Reader
+	delim      uint32 // Delimiter when reading from io.Reader; defaults to '\n'
+	monitoring int32  // C style bool; 0 == true, 1 == false
+	msg        chan *msgErr
 
 	stMap map[string][]func(string)
 	stMut sync.RWMutex
@@ -35,26 +32,83 @@ type Console struct {
 	reMut sync.RWMutex
 }
 
-// Create a new Console with os.Stdin
-func New() *Console {
-	return NewReader(os.Stdin)
+// Create Console with `rd`. If there are any errors while reading from `rd`
+// Console will stop parsing input and Close
+func New(rd io.Reader) *Console {
+	console := &Console{
+		reader:     bufio.NewReader(rd),
+		monitoring: 0,
+		delim:      '\n',
+
+		msg:   make(chan *msgErr, 5),
+		stMap: make(map[string][]func(string), 5),
+		reMap: make([]*re, 0, 5),
+	}
+	go console.monitor()
+
+	return console
 }
 
-// Create a console with the Reader rc
-func NewReader(rc io.Reader) *Console {
-	return &Console{
-		reader:  bufio.NewReader(rc),
-		stMap:   make(map[string][]func(string), 5),
-		Delim:   '\n',
-		running: false,
-		msg:     make(chan *msgErr, 5),
-		exit:    make(chan bool),
+// Called when a new Console object is created
+func (self *Console) monitor() {
+	self.setMonitor(true)
+	defer func() { self.Close() }()
+
+	go func() {
+		for {
+			s, err := self.reader.ReadString(self.Delim())
+
+			select {
+			case self.msg <- &msgErr{s[:len(s)-1], err}:
+			default:
+				return
+			}
+
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for msg := range self.msg {
+		if msg.err != nil && msg.err != io.EOF {
+			return
+		}
+
+		go self.handleRegexp(msg.msg)
+		go self.handleString(msg.msg)
+
+		if msg.err == io.EOF {
+			return
+		}
 	}
 }
 
+// Stop parsing input from Console
+func (self *Console) Close() {
+	if !self.Monitoring() {
+		return
+	}
+
+	self.setMonitor(false)
+	close(self.msg)
+}
+
 // Register a function that is called when trigger is matched. The input string
-// is passed to the function to be called. Triggered functions are run in a goroutine.
-func (self *Console) Register(trigger string, fn func(string)) {
+// is passed to the function to be called. Triggered functions run concurrently.
+func (self *Console) Register(trigger interface{}, fn func(string)) {
+	switch trigger.(type) {
+	case string:
+		self.registerString(trigger.(string), fn)
+	case *regexp.Regexp:
+		self.registerRegexp(trigger.(*regexp.Regexp), fn)
+	case regexp.Regexp:
+		re := trigger.(regexp.Regexp)
+		self.registerRegexp(&re, fn)
+	}
+}
+
+func (self *Console) registerString(trigger string, fn func(string)) {
 	self.stMut.Lock()
 	defer self.stMut.Unlock()
 
@@ -64,8 +118,8 @@ func (self *Console) Register(trigger string, fn func(string)) {
 }
 
 // Register a function that is called when trigger is matched. The input string
-// is passed to the function to be called. Triggered functions are run in a goroutine.
-func (self *Console) RegisterRegexp(trigger *regexp.Regexp, fn func(string)) {
+// is passed to the function to be called. Triggered functions run concurrently.
+func (self *Console) registerRegexp(trigger *regexp.Regexp, fn func(string)) {
 	reM := &re{
 		re: trigger,
 		fn: fn,
@@ -79,56 +133,24 @@ func (self *Console) RegisterRegexp(trigger *regexp.Regexp, fn func(string)) {
 
 // Returns true if it is monitoring input
 func (self *Console) Monitoring() bool {
-	self.mut.RLock()
-	defer self.mut.RUnlock()
-
-	return self.running
+	return atomic.LoadInt32(&self.monitoring) == 1
 }
 
 func (self *Console) setMonitor(m bool) {
-	self.mut.Lock()
-	defer self.mut.Unlock()
-
-	self.running = m
-}
-
-// Reads from the set io.Reader and calls functions as necessary. An error can
-// indicate either the Console is already monitoring or if there was an error
-// reading from io.Reader
-func (self *Console) Monitor() error {
-	if self.Monitoring() {
-		return errors.New("Already monitoring")
+	run := int32(0) // Default to false
+	if m == true {
+		run = 1
 	}
 
-	self.setMonitor(true)
-	defer self.setMonitor(false)
-
-	// TODO - Exit goroutine
-	go func() {
-		for {
-			s, err := self.reader.ReadString(self.Delim)
-			self.msg <- &msgErr{s[:len(s)-1], err}
-		}
-	}()
-
-	for {
-		select {
-		case m := <-self.msg:
-			if m.err != nil {
-				return m.err
-			}
-
-			go self.handleRegexp(m.msg)
-			go self.handleString(m.msg)
-		case <-self.exit:
-			return nil
-		}
-	}
+	atomic.StoreInt32(&self.monitoring, run)
 }
 
-// Stops the Console from monitoring. Call this to clean up goroutines
-func (self *Console) Stop() {
-	self.exit <- true
+func (self *Console) Delim() byte {
+	return byte(atomic.LoadUint32(&self.delim))
+}
+
+func (self *Console) SetDlim(c byte) {
+	atomic.StoreUint32(&self.delim, uint32(c))
 }
 
 // Parse cmd and call appropriate functions
@@ -147,7 +169,7 @@ func (self *Console) handleRegexp(cmd string) {
 	defer self.reMut.RUnlock()
 
 	for _, reM := range self.reMap {
-		if reM.re.FindStringSubmatch(cmd) != nil {
+		if reM.re.MatchString(cmd) {
 			go reM.fn(cmd)
 		}
 	}
